@@ -1213,7 +1213,7 @@ cache_clear(lua_State *L) {
 
 static int
 delete_key(lua_State *L){
-	char *key = luaL_checkstring(L, 1);
+	const char* key = luaL_checkstring(L, 1);
 	delete(key);
 	return 0;
 }
