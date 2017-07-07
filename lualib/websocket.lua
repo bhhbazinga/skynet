@@ -4,7 +4,7 @@ local socket       = require "skynet.socket"
 local sockethelper = require "http.sockethelper"
 local httpd        = require "http.httpd"
 local urllib       = require "http.url"
-local string       = require "string"
+local string       = string
 
 local ws = {}
 local ws_mt = { __index = ws }
@@ -116,8 +116,6 @@ function ws.new(id, header, handler, conf)
 	local self = {
 		id = id,
 		handler = handler,
-		client_terminated = false,
-		server_terminated = false,
 		mask_outgoing = conf.mask_outgoing,
 		check_origin = conf.check_origin
 	}
@@ -127,23 +125,12 @@ function ws.new(id, header, handler, conf)
 	return setmetatable(self, ws_mt)
 end
 
-
 function ws:send_frame(fin, opcode, data)
-	local finbit, mask_bit
-	if fin then
-		finbit = 0x80
-	else
-		finbit = 0
-	end
+	local finbit = fin and 0x80 or 0
+	local mask_bit = self.mask_outgoing and 0x80 or 0
 
 	local frame = string.pack("B", finbit | opcode)
 	local l = #data
-
-	if self.mask_outgoing then
-		mask_bit = 0x80
-	else
-		mask_bit = 0
-	end
 
 	if l < 126 then
 		frame = frame .. string.pack("B", l | mask_bit)
@@ -153,11 +140,10 @@ function ws:send_frame(fin, opcode, data)
 		frame = frame .. string.pack(">BL", 127 | mask_bit, l)
 	end
 
-	if self.mask_outgoing then
-	end
+--	if self.mask_outgoing then
+--	end
 
 	frame = frame .. data
-
 	write(self.id, frame)
 end
 
@@ -178,49 +164,25 @@ function ws:send_pong(data)
 end
 
 function ws:close(code, reason)
-	-- 1000  "normal closure" status code
-	if not self.server_terminated then
-		if code == nil and reason ~= nil then
-			code = 1000
-		end
-		local data = ""
-		if code ~= nil then
-			data = string.pack(">H", code)
-		end
-		if reason ~= nil then
-			data = data .. reason
-		end
-		self:send_frame(true, 0x8, data)
-
-		self.server_terminated = true
+	-- 1000 "normal close" status code
+	if self._closed then
+		return
 	end
 
-	if self.client_terminated then
-		socket.close(self.id)
-	end
-end
+	code = code or 1000
+	reason = reason or "normal close"
+	local data = string.pack(">H", code) .. reason
+	self:send_frame(true, 0x8, data)
+	self.server_terminated = true
 
-function ws:recv()
-	local data = ""
-	while true do
-		local success, final, message = self:recv_frame()
-		if not success then
-			return success, message
-		end
-		if final then
-			data = data .. message
-			break
-		else
-			data = data .. message
-		end
-	end
-	self.handler.on_message(self, data)
-	return data
+	socket.close(self.id)
+	self.handler.on_close(self, code, reason)
+	self._closed = true
 end
 
 local function websocket_mask(mask, data, length)
 	local umasked = {}
-	for i=1, length do
+	for i = 1, length do
 		umasked[i] = string.char(string.byte(data, i) ~ string.byte(mask, (i-1)%4 + 1))
 	end
 	return table.concat(umasked)
@@ -228,7 +190,6 @@ end
 
 function ws:recv_frame()
 	local data, err = read(self.id, 2)
-
 	if not data then
 		return false, nil, "Read first 2 byte error: " .. err
 	end
@@ -264,14 +225,12 @@ function ws:recv_frame()
 
 	if payloadlen < 126 then
 		frame_length = payloadlen
-
 	elseif payloadlen == 126 then
 		local h_data, err = read(self.id, 2)
 		if not h_data then
 			return false, nil, "Payloadlen 126 read true length error:" .. err
 		end
 		frame_length = string.unpack(">H", h_data)
-
 	else --payloadlen == 127
 		local l_data, err = read(self.id, 8)
 		if not l_data then
@@ -288,9 +247,7 @@ function ws:recv_frame()
 		frame_mask = mask
 	end
 
-	--print('final_frame:', final_frame, "frame_opcode:", frame_opcode, "mask_frame:", mask_frame, "frame_length:", frame_length)
-
-	local  frame_data = ""
+	local frame_data = ""
 	if frame_length > 0 then
 		local fdata, err = read(self.id, frame_length)
 		if not fdata then
@@ -306,7 +263,7 @@ function ws:recv_frame()
 	if not final_frame then
 		return true, false, frame_data
 	else
-		if frame_opcode  == 0x1 then -- text
+		if frame_opcode == 0x1 then -- text
 			return true, true, frame_data
 		elseif frame_opcode == 0x2 then -- binary
 			return true, true, frame_data
@@ -318,9 +275,8 @@ function ws:recv_frame()
 			if #frame_data > 2 then
 				reason = frame_data:sub(3)
 			end
-			self.client_terminated = true
-			self:close()
-			self.handler.on_close(self, code, reason)
+			self:close(code, reason)
+			return false, true, nil
 		elseif frame_opcode == 0x9 then --Ping
 			self:send_pong()
 		elseif frame_opcode == 0xA then -- Pong
@@ -332,11 +288,16 @@ function ws:recv_frame()
 end
 
 function ws:start()
-	while true do
-		local message, err = self:recv()
-		if not message then
-			socket.close(self.id)
-			self.handler.on_close(self)
+	local frame = ""
+	while not self._closed do
+		local success, packend, frame_segment = self:recv_frame()
+		if not success then
+			break
+		end
+		frame = frame .. frame_segment
+		if packend then
+			self.handler.on_message(self, frame)
+			frame = ""
 		end
 	end
 end
